@@ -1,0 +1,17 @@
+[Unit]
+Description=Example Container
+After=network.target
+
+[Container]
+Image=nginx:latest
+ContainerName=example-nginx
+PublishPort=8080:80
+Environment=NGINX_HOST=example.com
+Environment=NGINX_PORT=80
+
+[Service]
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target 
