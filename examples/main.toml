@@ -1,9 +1,8 @@
 [git]
 repository_url = "git@gitlab.com:devops_stuff/gitops.git"
 branch = "main"
-poll_interval = 300
+poll_interval = 120
 ssh_key_path = "/home/nemanja/.ssh/id_rsa"
-quadlet_files_dir = "draw"
 
 [podman]
 quadlet_dir = "~/.config/containers/systemd"
@@ -13,6 +12,9 @@ backup_dir = "~/bin"
 enabled = true
 port = 8000
 host = "0.0.0.0"
+
+[applications]
+enabled = ["draw", "markdown"]
 
 #[notifications]
 #enabled = true

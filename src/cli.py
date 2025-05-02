@@ -2,16 +2,18 @@ import click
 import logging
 import os
 import time
+import json
 from pathlib import Path
-from .core.config import Config
-from .core.git_operations import GitOperations
-from .core.quadlet_handler import QuadletHandler
-from .core.systemd_manager import SystemdManager
-from .core.health_checker import HealthChecker
-from .core.logging import setup_logging, get_logger
-from .state.manager import StateManager
-from .core.rollback import RollbackManager
-from datetime import datetime
+from typing import Dict, Any, Optional
+
+from src.core.config import Config
+from src.core.git_operations import GitOperations
+from src.core.quadlet_handler import QuadletHandler
+from src.core.systemd_manager import SystemdManager
+from src.core.app_manager import ApplicationManager
+from src.core.env_processor import EnvProcessor
+from src.state.manager import StateManager
+from src.core.logging import setup_logging, get_logger
 
 # Get logger for CLI
 logger = get_logger("src.cli")
@@ -20,11 +22,12 @@ def get_user_paths():
     """Get user-specific paths for rootless operation."""
     user_home = Path.home()
     return {
+        'config_dir': user_home / '.local/lib/podman-gitops',
+        'config_file': user_home / '.local/lib/podman-gitops/main.toml',
         'repo_dir': user_home / '.local/lib/podman-gitops/repo',
         'backup_dir': user_home / '.local/lib/podman-gitops/backups',
-        'config_dir': user_home / '.config/podman-gitops',
         'state_db': user_home / '.local/lib/podman-gitops/state.db',
-        'quadlet_dir': user_home / '.config/containers/systemd',
+        'processed_dir': user_home / '.local/lib/podman-gitops/processed',
         'log_dir': user_home / '.local/lib/podman-gitops/logs'
     }
 
@@ -34,427 +37,504 @@ def ensure_directories(paths):
         if isinstance(path, Path):
             path.parent.mkdir(parents=True, exist_ok=True)
 
-def process_quadlet_files(quadlet_handler: QuadletHandler, systemd_manager: SystemdManager, health_checker: HealthChecker, state_manager: StateManager, repo_dir: Path, quadlet_dir: str):
-    """Process quadlet files from the repository."""
-    try:
-        # Find all files in the specified directory
-        quadlet_path = repo_dir / quadlet_dir
-        files = list(quadlet_path.glob("*.*"))
-        
-        # Group files by type
-        files_by_type = {
-            'network': [],
-            'volume': [],
-            'image': [],
-            'container': []
-        }
-        
-        for file in files:
-            file_type = quadlet_handler._get_file_type(file)
-            if file_type in files_by_type:
-                files_by_type[file_type].append(file)
-        
-        # Process all files first without starting services
-        deployed_files = []
-        for file_type, files in files_by_type.items():
-            for file_path in files:
-                name = file_path.stem
-                logger.info(f"Processing {file_type} file: {name}")
-                
-                # Deploy the file
-                if quadlet_handler.deploy_quadlet_file(file_path):
-                    deployed_files.append((name, file_type))
-                    # Set initial service state
-                    state_manager.set_service_state(name, "deployed")
-                else:
-                    logger.error(f"Failed to deploy {file_type} file: {name}")
-                    # Record the error
-                    state_manager.set_last_error(name, f"Failed to deploy {file_type} file")
-                    # Roll back all changes
-                    for deployed_name, deployed_type in deployed_files:
-                        quadlet_handler.remove_quadlet_file(deployed_name, deployed_type)
-                    return False
-        
-        # After all files are deployed, reload systemd
-        if deployed_files:
-            logger.info("Reloading systemd daemon")
-            systemd_manager.reload_daemon()
-        
-        # Now start services in the correct order
-        for file_type in ['network', 'volume', 'image', 'container']:
-            if file_type in files_by_type:
-                for file_path in files_by_type[file_type]:
-                    name = file_path.stem
-                    if file_type == 'container':
-                        logger.info(f"Starting service: {name}")
-                        if systemd_manager.start_service(name):
-                            # Update service state
-                            state_manager.set_service_state(name, "starting")
-                            # Wait for container to become healthy
-                            if health_checker.wait_for_healthy(name):
-                                logger.info(f"Service {name} started successfully and is healthy")
-                                # Update service state and record health check
-                                state_manager.set_service_state(name, "running")
-                                health_data = health_checker.check_container_health(name)
-                                state_manager.add_health_check(name, health_data)
-                            else:
-                                logger.error(f"Service {name} started but failed health check")
-                                # Update service state and record error
-                                state_manager.set_service_state(name, "unhealthy")
-                                state_manager.set_last_error(name, "Health check failed")
-                                # Get container logs for debugging
-                                logs = health_checker.get_container_logs(name)
-                                if logs:
-                                    logger.error(f"Container logs:\n{logs}")
-                                # Roll back all changes
-                                for deployed_name, deployed_type in deployed_files:
-                                    quadlet_handler.remove_quadlet_file(deployed_name, deployed_type)
-                                    state_manager.remove_service_state(deployed_name)
-                                return False
-                        else:
-                            logger.error(f"Failed to start service {name}")
-                            # Update service state and record error
-                            state_manager.set_service_state(name, "failed")
-                            state_manager.set_last_error(name, "Failed to start service")
-                            # Roll back all changes
-                            for deployed_name, deployed_type in deployed_files:
-                                quadlet_handler.remove_quadlet_file(deployed_name, deployed_type)
-                                state_manager.remove_service_state(deployed_name)
-                            return False
-        
-        return True
-    except Exception as e:
-        logger.error(f"Error processing quadlet files: {e}")
-        # Record the error in state manager
-        state_manager.set_last_error("system", str(e))
-        return False
+def initialize_components(config_file: Path):
+    """Initialize all components based on configuration.
+
+    Args:
+        config_file: Path to the configuration file
+
+    Returns:
+        Tuple of (config, app_manager)
+    """
+    # Get user paths
+    paths = get_user_paths()
+
+    # Ensure all directories exist
+    ensure_directories(paths)
+
+    # Set up logging
+    setup_logging(paths['log_dir'], "INFO")
+
+    # Load configuration
+    if not config_file.exists():
+        raise click.ClickException(f"Configuration file not found: {config_file}")
+
+    config = Config.from_file(config_file)
+    config.load_app_configs(paths['config_dir'])
+    config.expand_paths()
+
+    # Initialize components
+    state_manager = StateManager(paths['state_db'])
+    systemd_manager = SystemdManager(config.podman.quadlet_dir)
+    quadlet_handler = QuadletHandler(
+        systemd_dir=config.podman.quadlet_dir,
+        processed_dir=paths['processed_dir'],
+        systemd_manager=systemd_manager
+    )
+
+    # Initialize Git operations if configured
+    git_ops = None
+    if config.git:
+        git_ops = GitOperations(config.git, paths['repo_dir'])
+
+    # Initialize application manager
+    app_manager = ApplicationManager(
+        config=config,
+        state_manager=state_manager,
+        quadlet_handler=quadlet_handler,
+        systemd_manager=systemd_manager,
+        git_ops=git_ops
+    )
+
+    return config, app_manager
 
 @click.group()
 def cli():
     """Podman GitOps CLI tool."""
     pass
 
+# Main service commands
 @cli.command()
-@click.option('--config', '-c', type=click.Path(exists=True), required=True, help='Path to config.toml file')
+@click.option('--config', '-c', type=click.Path(exists=True),
+              default=str(get_user_paths()['config_file']),
+              help='Path to config.toml file')
 def start(config):
     """Start the GitOps service."""
     try:
-        # Load configuration
-        config_path = Path(config)
-        config_data = Config.from_file(config_path)
-        
-        # Get user paths
-        paths = get_user_paths()
-        
-        # Ensure all directories exist
-        ensure_directories(paths)
-        
-        # Set up logging
-        setup_logging(paths['log_dir'], config_data.log_level)
-        
-        # Initialize components
-        git_ops = GitOperations(config_data.git, paths['repo_dir'])
-        systemd_manager = SystemdManager(paths['quadlet_dir'])
-        quadlet_handler = QuadletHandler(paths['quadlet_dir'], systemd_manager)
-        health_checker = HealthChecker()
-        state_manager = StateManager(paths['state_db'])
-        
-        # Start the service
-        logger.info("Starting Podman GitOps service")
-        
-        # Clone repository if it doesn't exist
-        if git_ops.clone_repository():
-            logger.info("Repository cloned successfully")
-        
-        while True:
-            try:
-                # Pull latest changes
-                if git_ops.pull_changes():
-                    logger.info("Changes pulled successfully")
-                    
-                    # Get current commit hash
-                    commit_hash = git_ops.get_current_commit()
-                    
-                    # Process quadlet files
-                    if process_quadlet_files(
-                        quadlet_handler, 
-                        systemd_manager,
-                        health_checker,
-                        state_manager,
-                        paths['repo_dir'],
-                        config_data.git.quadlet_files_dir
-                    ):
-                        # Record successful deployment
-                        state_manager.record_deployment(commit_hash, "success")
-                    else:
-                        # Record failed deployment
-                        state_manager.record_deployment(commit_hash, "failed", "Deployment failed")
-                    
-                # Wait for the next poll interval
-                time.sleep(config_data.git.poll_interval)
-                
-            except Exception as e:
-                logger.error(f"Error in service loop: {e}")
-                # Record failed deployment
-                state_manager.record_deployment(git_ops.get_current_commit(), "failed", str(e))
-                time.sleep(config_data.git.poll_interval)
-        
+        from src.main import main as service_main
+        import sys
+
+        # Pass the config file to the main service
+        sys.argv = ['main.py', '--config', config]
+        sys.exit(service_main())
+
     except Exception as e:
         logger.error(f"Failed to start service: {e}")
         raise click.ClickException(str(e))
 
+# Application commands
+@cli.group()
+def app():
+    """Manage applications."""
+    pass
+
+@app.command('list')
+@click.option('--config', '-c', type=click.Path(exists=True),
+              default=str(get_user_paths()['config_file']),
+              help='Path to config.toml file')
+@click.option('--json', '-j', is_flag=True, help='Output in JSON format')
+def list_apps(config, json):
+    """List all configured applications."""
+    try:
+        # Initialize components
+        config_path = Path(config)
+        config_obj, app_manager = initialize_components(config_path)
+
+        # Get application status
+        app_status = app_manager.get_status_all_applications()
+
+        if json:
+            # Print JSON output
+            click.echo(json.dumps(app_status, indent=2))
+        else:
+            # Print formatted output
+            click.echo("\nConfigured Applications:")
+            click.echo("=" * 80)
+
+            for app_name, status in app_status.items():
+                status_symbol = "✅" if status.get('overall_status') == 'healthy' else "❌"
+                click.echo(f"\n{status_symbol} {app_name}")
+
+                # Application description
+                app_config = config_obj.app_configs.get(app_name)
+                if app_config and app_config.description:
+                    click.echo(f"   Description: {app_config.description}")
+
+                # Service count and status
+                service_count = status.get('service_count', 0)
+                click.echo(f"   Services: {service_count}")
+
+                # State counts
+                state_counts = status.get('state_counts', {})
+                if state_counts:
+                    states = ", ".join([f"{state}: {count}" for state, count in state_counts.items()])
+                    click.echo(f"   States: {states}")
+
+                # Last deployment
+                last_deployment = status.get('last_deployment', {})
+                if last_deployment:
+                    deploy_status = last_deployment.get('status', 'unknown')
+                    deploy_time = last_deployment.get('timestamp', 'unknown')
+                    click.echo(f"   Last Deployment: {deploy_status} at {deploy_time}")
+
+                # Error count
+                error_count = status.get('error_count', 0)
+                if error_count > 0:
+                    click.echo(f"   Errors: {error_count}")
+
+    except Exception as e:
+        logger.error(f"Failed to list applications: {e}")
+        raise click.ClickException(str(e))
+
+@app.command('status')
+@click.argument('app_name')
+@click.option('--config', '-c', type=click.Path(exists=True),
+              default=str(get_user_paths()['config_file']),
+              help='Path to config.toml file')
+@click.option('--json', '-j', is_flag=True, help='Output in JSON format')
+def app_status(app_name, config, json):
+    """Get detailed status of an application."""
+    try:
+        # Initialize components
+        config_path = Path(config)
+        config_obj, app_manager = initialize_components(config_path)
+
+        # Check if application exists
+        if app_name not in config_obj.applications.enabled:
+            click.echo(f"Application '{app_name}' is not enabled in configuration")
+            return
+
+        # Get application status
+        status = app_manager.get_application_status(app_name)
+
+        if json:
+            # Print JSON output
+            click.echo(json.dumps(status, indent=2))
+        else:
+            # Print formatted output
+            click.echo(f"\nApplication: {app_name}")
+            click.echo("=" * 80)
+
+            # Application description
+            app_config = config_obj.app_configs.get(app_name)
+            if app_config and app_config.description:
+                click.echo(f"Description: {app_config.description}")
+
+            # Overall status
+            overall_status = status.get('overall_status', 'unknown')
+            click.echo(f"Status: {overall_status}")
+
+            # Last deployment
+            last_deployment = status.get('last_deployment', {})
+            if last_deployment:
+                click.echo("\nLast Deployment:")
+                click.echo(f"  Status: {last_deployment.get('status', 'unknown')}")
+                click.echo(f"  Time: {last_deployment.get('timestamp', 'unknown')}")
+                click.echo(f"  Commit: {last_deployment.get('commit_hash', 'unknown')}")
+                if last_deployment.get('error_message'):
+                    click.echo(f"  Error: {last_deployment.get('error_message')}")
+
+            # Services
+            services = status.get('services', {})
+            if services:
+                click.echo("\nServices:")
+                for service_name, state in services.items():
+                    click.echo(f"  {service_name}: {state}")
+
+            # Error count
+            error_count = status.get('error_count', 0)
+            if error_count > 0:
+                click.echo(f"\nErrors: {error_count}")
+
+    except Exception as e:
+        logger.error(f"Failed to get application status: {e}")
+        raise click.ClickException(str(e))
+
+@app.command('start')
+@click.argument('app_name')
+@click.option('--config', '-c', type=click.Path(exists=True),
+              default=str(get_user_paths()['config_file']),
+              help='Path to config.toml file')
+def start_app(app_name, config):
+    """Start all services for an application."""
+    try:
+        # Initialize components
+        config_path = Path(config)
+        config_obj, app_manager = initialize_components(config_path)
+
+        # Check if application exists
+        if app_name not in config_obj.applications.enabled:
+            click.echo(f"Application '{app_name}' is not enabled in configuration")
+            return
+
+        # Start the application
+        click.echo(f"Starting application: {app_name}")
+        if app_manager.start_application(app_name):
+            click.echo(f"Application {app_name} started successfully")
+        else:
+            click.echo(f"Failed to start application {app_name}")
+
+    except Exception as e:
+        logger.error(f"Failed to start application: {e}")
+        raise click.ClickException(str(e))
+
+@app.command('stop')
+@click.argument('app_name')
+@click.option('--config', '-c', type=click.Path(exists=True),
+              default=str(get_user_paths()['config_file']),
+              help='Path to config.toml file')
+def stop_app(app_name, config):
+    """Stop all services for an application."""
+    try:
+        # Initialize components
+        config_path = Path(config)
+        config_obj, app_manager = initialize_components(config_path)
+
+        # Check if application exists
+        if app_name not in config_obj.applications.enabled:
+            click.echo(f"Application '{app_name}' is not enabled in configuration")
+            return
+
+        # Stop the application
+        click.echo(f"Stopping application: {app_name}")
+        if app_manager.stop_application(app_name):
+            click.echo(f"Application {app_name} stopped successfully")
+        else:
+            click.echo(f"Failed to stop application {app_name}")
+
+    except Exception as e:
+        logger.error(f"Failed to stop application: {e}")
+        raise click.ClickException(str(e))
+
+@app.command('restart')
+@click.argument('app_name')
+@click.option('--config', '-c', type=click.Path(exists=True),
+              default=str(get_user_paths()['config_file']),
+              help='Path to config.toml file')
+def restart_app(app_name, config):
+    """Restart all services for an application."""
+    try:
+        # Initialize components
+        config_path = Path(config)
+        config_obj, app_manager = initialize_components(config_path)
+
+        # Check if application exists
+        if app_name not in config_obj.applications.enabled:
+            click.echo(f"Application '{app_name}' is not enabled in configuration")
+            return
+
+        # Restart the application
+        click.echo(f"Restarting application: {app_name}")
+        if app_manager.restart_application(app_name):
+            click.echo(f"Application {app_name} restarted successfully")
+        else:
+            click.echo(f"Failed to restart application {app_name}")
+
+    except Exception as e:
+        logger.error(f"Failed to restart application: {e}")
+        raise click.ClickException(str(e))
+
+@app.command('deploy')
+@click.argument('app_name')
+@click.option('--config', '-c', type=click.Path(exists=True),
+              default=str(get_user_paths()['config_file']),
+              help='Path to config.toml file')
+def deploy_app(app_name, config):
+    """Deploy or update an application."""
+    try:
+        # Initialize components
+        config_path = Path(config)
+        config_obj, app_manager = initialize_components(config_path)
+
+        # Check if application exists
+        if app_name not in config_obj.applications.enabled:
+            click.echo(f"Application '{app_name}' is not enabled in configuration")
+            return
+
+        # Deploy the application
+        click.echo(f"Deploying application: {app_name}")
+        if app_manager.process_application(app_name):
+            click.echo(f"Application {app_name} deployed successfully")
+        else:
+            click.echo(f"Failed to deploy application {app_name}")
+
+    except Exception as e:
+        logger.error(f"Failed to deploy application: {e}")
+        raise click.ClickException(str(e))
+
+# Service commands
 @cli.command()
 @click.argument('service_name')
-def status(service_name):
+@click.option('--app', '-a', help='Application name')
+@click.option('--config', '-c', type=click.Path(exists=True),
+              default=str(get_user_paths()['config_file']),
+              help='Path to config.toml file')
+def status(service_name, app, config):
     """Get the status of a service."""
     try:
-        paths = get_user_paths()
-        systemd_manager = SystemdManager(paths['quadlet_dir'])
-        health_checker = HealthChecker()
-        
+        # Initialize components
+        config_path = Path(config)
+        _, app_manager = initialize_components(config_path)
+
         # Get systemd status
-        systemd_status = systemd_manager.get_service_status(service_name)
-        
-        # Get container health
-        health_status = health_checker.check_container_health(service_name)
-        
+        systemd_status = app_manager.systemd_manager.get_service_status(service_name)
+
+        # Try to determine the application if not provided
+        if not app:
+            all_status = app_manager.get_status_all_applications()
+            for app_name, status in all_status.items():
+                if service_name in status.get('services', {}):
+                    app = app_name
+                    break
+
+        # Get service state from state manager if possible
+        service_state = None
+        if app:
+            service_state = app_manager.state_manager.get_service_state(app, service_name)
+
         click.echo(f"Service: {service_name}")
+        if app:
+            click.echo(f"Application: {app}")
         click.echo(f"Systemd Status: {systemd_status['active']}")
-        click.echo(f"Container State: {health_status['state']}")
-        click.echo(f"Health Status: {health_status['status']}")
+        if service_state:
+            click.echo(f"Tracked State: {service_state}")
+
         click.echo("\nSystemd Details:")
         click.echo(systemd_status['details'])
-        
+
     except Exception as e:
         logger.error(f"Failed to get service status: {e}")
         raise click.ClickException(str(e))
 
-@cli.command()
-def list_services():
+@cli.command('list-services')
+@click.option('--app', '-a', help='Filter by application name')
+@click.option('--config', '-c', type=click.Path(exists=True),
+              default=str(get_user_paths()['config_file']),
+              help='Path to config.toml file')
+def list_services(app, config):
     """List all managed services."""
     try:
-        paths = get_user_paths()
-        systemd_manager = SystemdManager(paths['quadlet_dir'])
-        health_checker = HealthChecker()
-        
-        services = systemd_manager.list_services()
-        if services:
-            click.echo("Managed services:")
-            for service in services:
-                health = health_checker.check_container_health(service)
-                status = "healthy" if health["healthy"] else "unhealthy"
-                click.echo(f"- {service} ({status})")
+        # Initialize components
+        config_path = Path(config)
+        _, app_manager = initialize_components(config_path)
+
+        if app:
+            # Show services for a specific application
+            app_status = app_manager.get_application_status(app)
+            services = app_status.get('services', {})
+
+            if not services:
+                click.echo(f"No services found for application {app}")
+                return
+
+            click.echo(f"\nServices for application {app}:")
+            for service_name, state in services.items():
+                click.echo(f"- {service_name}: {state}")
         else:
-            click.echo("No services found")
+            # Show all services
+            all_status = app_manager.get_status_all_applications()
+
+            if not all_status:
+                click.echo("No services found")
+                return
+
+            click.echo("\nAll managed services:")
+            for app_name, status in all_status.items():
+                services = status.get('services', {})
+                if services:
+                    click.echo(f"\nApplication: {app_name}")
+                    for service_name, state in services.items():
+                        click.echo(f"- {service_name}: {state}")
+
     except Exception as e:
         logger.error(f"Failed to list services: {e}")
         raise click.ClickException(str(e))
 
 @cli.command()
 @click.argument('service_name')
-def restart(service_name):
+@click.option('--app', '-a', help='Application name')
+@click.option('--config', '-c', type=click.Path(exists=True),
+              default=str(get_user_paths()['config_file']),
+              help='Path to config.toml file')
+def restart(service_name, app, config):
     """Restart a service."""
     try:
-        paths = get_user_paths()
-        systemd_manager = SystemdManager(paths['quadlet_dir'])
-        health_checker = HealthChecker()
-        
-        if systemd_manager.restart_service(service_name):
-            # Wait for container to become healthy
-            if health_checker.wait_for_healthy(service_name):
-                click.echo(f"Service {service_name} restarted successfully and is healthy")
-            else:
-                click.echo(f"Service {service_name} restarted but failed health check")
-                logs = health_checker.get_container_logs(service_name)
-                if logs:
-                    click.echo(f"\nContainer logs:\n{logs}")
+        # Initialize components
+        config_path = Path(config)
+        _, app_manager = initialize_components(config_path)
+
+        # Try to determine the application if not provided
+        if not app:
+            all_status = app_manager.get_status_all_applications()
+            for app_name, status in all_status.items():
+                if service_name in status.get('services', {}):
+                    app = app_name
+                    break
+
+        if app_manager.systemd_manager.restart_service(service_name):
+            click.echo(f"Service {service_name} restarted successfully")
+
+            # Update state if application is known
+            if app:
+                app_manager.state_manager.set_service_state(app, service_name, "running")
         else:
             click.echo(f"Failed to restart service {service_name}")
+
     except Exception as e:
         logger.error(f"Failed to restart service: {e}")
         raise click.ClickException(str(e))
 
-@cli.command()
-@click.option('--config', '-c', type=click.Path(exists=True), required=True, help='Path to config.toml file')
-def check_quadlets(config):
-    """Check the status of all files in the repository and their deployment."""
-    try:
-        # Load configuration
-        config_path = Path(config)
-        config_data = Config.from_file(config_path)
-        
-        # Get user paths
-        paths = get_user_paths()
-        
-        # Initialize components
-        git_ops = GitOperations(config_data.git, paths['repo_dir'])
-        quadlet_handler = QuadletHandler(paths['quadlet_dir'])
-        
-        # Get repository path
-        repo_dir = config_data.git.repo_dir or paths['repo_dir']
-        quadlet_dir = config_data.git.quadlet_files_dir
-        
-        # Construct the path to files directory
-        files_path = repo_dir / quadlet_dir if quadlet_dir else repo_dir
-        
-        click.echo(f"Repository directory: {repo_dir}")
-        click.echo(f"Files directory: {files_path}")
-        click.echo(f"Deployment directory: {paths['quadlet_dir']}")
-        
-        # Get deployed files
-        deployed_files = quadlet_handler.get_deployed_files()
-        
-        # Find all files in the repository
-        files = quadlet_handler.find_quadlet_files(files_path)
-        
-        if not files:
-            click.echo("\nNo files found in repository")
-            return
-        
-        # Group files by type
-        files_by_type = {}
-        for file_path in files:
-            file_type = quadlet_handler._get_file_type(file_path)
-            if file_type not in files_by_type:
-                files_by_type[file_type] = []
-            files_by_type[file_type].append(file_path)
-        
-        # Display files by type
-        for file_type, type_files in files_by_type.items():
-            click.echo(f"\n{file_type.upper()} Files:")
-            click.echo("=" * 80)
-            
-            for file_path in type_files:
-                click.echo(f"\nFile: {file_path.name}")
-                click.echo(f"Path: {file_path}")
-                
-                # Check if file is deployed
-                if file_type in quadlet_handler.QUADLET_TYPES:
-                    deployed_path = paths['quadlet_dir'] / f"{file_path.stem}{quadlet_handler.QUADLET_TYPES[file_type]}"
-                else:
-                    deployed_path = paths['quadlet_dir'] / file_path.name
-                
-                if deployed_path.exists():
-                    click.echo("Status: Deployed")
-                    # Compare contents
-                    repo_content = file_path.read_text()
-                    deployed_content = deployed_path.read_text()
-                    if repo_content == deployed_content:
-                        click.echo("Content: Up to date")
-                    else:
-                        click.echo("Content: Different from repository")
-                else:
-                    click.echo("Status: Not deployed")
-                
-                # Show file contents
-                click.echo("\nContent:")
-                click.echo(file_path.read_text())
-                click.echo("-" * 80)
-        
-        # Show deployment summary
-        click.echo("\nDeployment Summary:")
-        click.echo("=" * 80)
-        for file_type, files in deployed_files.items():
-            if files:
-                click.echo(f"\n{file_type.upper()} files deployed:")
-                for file in sorted(files):
-                    click.echo(f"- {file}")
-        
-    except Exception as e:
-        logger.error(f"Failed to check files: {e}")
-        raise click.ClickException(str(e))
+# Config commands
+@cli.group()
+def config():
+    """Manage configuration."""
+    pass
 
-@cli.command()
-@click.option('--config', '-c', type=click.Path(exists=True), required=True, help='Path to config.toml file')
-def list_backups(config):
-    """List all available backups."""
+@config.command('show')
+@click.option('--app', '-a', help='Show configuration for a specific application')
+@click.option('--config', '-c', type=click.Path(exists=True),
+              default=str(get_user_paths()['config_file']),
+              help='Path to config.toml file')
+def show_config(app, config):
+    """Show the current configuration."""
     try:
         # Load configuration
         config_path = Path(config)
-        config_data = Config.from_file(config_path)
-        
-        # Get user paths
-        paths = get_user_paths()
-        
-        # Initialize rollback manager
-        rollback_manager = RollbackManager(paths['backup_dir'])
-        
-        # Get all backups
-        backups = rollback_manager.list_backups()
-        
-        if not backups:
-            click.echo("No backups found")
-            return
-        
-        click.echo("Available backups:")
-        click.echo("=" * 80)
-        
-        for backup in backups:
-            click.echo(f"\nFile: {backup.name}")
-            click.echo(f"Path: {backup}")
-            click.echo(f"Created: {datetime.fromtimestamp(backup.stat().st_mtime)}")
-            click.echo("-" * 80)
-        
-    except Exception as e:
-        logger.error(f"Failed to list backups: {e}")
-        raise click.ClickException(str(e))
+        config_obj = Config.from_file(config_path)
+        config_obj.load_app_configs(config_path.parent)
 
-@cli.command()
-@click.option('--config', '-c', type=click.Path(exists=True), required=True, help='Path to config.toml file')
-@click.argument('file_name')
-def restore_backup(config, file_name):
-    """Restore a file from its latest backup."""
-    try:
-        # Load configuration
-        config_path = Path(config)
-        config_data = Config.from_file(config_path)
-        
-        # Get user paths
-        paths = get_user_paths()
-        
-        # Initialize rollback manager
-        rollback_manager = RollbackManager(paths['backup_dir'])
-        
-        # Get latest backup
-        backup = rollback_manager.get_latest_backup(file_name)
-        if not backup:
-            click.echo(f"No backup found for {file_name}")
-            return
-        
-        # Restore the backup
-        target_path = paths['quadlet_dir'] / backup.name.split('_')[0]
-        if rollback_manager.restore_backup(target_path, backup):
-            click.echo(f"Successfully restored {file_name} from backup")
+        if app:
+            # Show configuration for a specific application
+            if app not in config_obj.app_configs:
+                click.echo(f"Application '{app}' not found in configuration")
+                return
+
+            app_config = config_obj.app_configs[app]
+            click.echo(f"\nConfiguration for application: {app}")
+            click.echo(f"Description: {app_config.description or 'N/A'}")
+            click.echo(f"Quadlet Directory: {app_config.quadlet_dir}")
+
+            if app_config.env:
+                click.echo("\nEnvironment Variables:")
+                for key, value in app_config.env.items():
+                    click.echo(f"  {key}={value}")
         else:
-            click.echo(f"Failed to restore {file_name} from backup")
-        
-    except Exception as e:
-        logger.error(f"Failed to restore backup: {e}")
-        raise click.ClickException(str(e))
+            # Show global configuration
+            click.echo("\nGlobal Configuration:")
 
-@cli.command()
-@click.option('--config', '-c', type=click.Path(exists=True), required=True, help='Path to config.toml file')
-@click.option('--max-backups', '-m', type=int, default=5, help='Maximum number of backups to keep')
-def cleanup_backups(config, max_backups):
-    """Clean up old backups, keeping only the most recent ones."""
-    try:
-        # Load configuration
-        config_path = Path(config)
-        config_data = Config.from_file(config_path)
-        
-        # Get user paths
-        paths = get_user_paths()
-        
-        # Initialize rollback manager
-        rollback_manager = RollbackManager(paths['backup_dir'])
-        
-        # Clean up old backups
-        rollback_manager.cleanup_old_backups(max_backups)
-        click.echo(f"Successfully cleaned up old backups, keeping {max_backups} most recent ones")
-        
+            if config_obj.git:
+                click.echo("\nGit Configuration:")
+                click.echo(f"  Repository URL: {config_obj.git.repository_url}")
+                click.echo(f"  Branch: {config_obj.git.branch}")
+                click.echo(f"  Poll Interval: {config_obj.git.poll_interval} seconds")
+
+            click.echo("\nPodman Configuration:")
+            click.echo(f"  Quadlet Directory: {config_obj.podman.quadlet_dir}")
+            click.echo(f"  Backup Directory: {config_obj.podman.backup_dir}")
+
+            click.echo("\nMetrics Configuration:")
+            click.echo(f"  Enabled: {config_obj.metrics.enabled}")
+            if config_obj.metrics.enabled:
+                click.echo(f"  Host: {config_obj.metrics.host}")
+                click.echo(f"  Port: {config_obj.metrics.port}")
+
+            click.echo("\nEnabled Applications:")
+            for app_name in config_obj.applications.enabled:
+                click.echo(f"  - {app_name}")
+
     except Exception as e:
-        logger.error(f"Failed to cleanup backups: {e}")
+        logger.error(f"Failed to show configuration: {e}")
         raise click.ClickException(str(e))
 
 if __name__ == '__main__':
-    cli() 
+    cli()
