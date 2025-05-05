@@ -27,7 +27,7 @@ def setup_logging(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     console_formatter = logging.Formatter(
-        '%(levelname)s: %(message)s'
+        '%(asctime)s - %(levelname)s: %(message)s'
     )
     
     # Set up file handler with rotation

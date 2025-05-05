@@ -13,15 +13,16 @@ dependencies = [
     "python-dotenv>=0.19.0",
     "prometheus-client>=0.11.0",
     "toml>=0.10.2",
-    "click>=8.0.0",
+    "typer>=0.9.0",
     "httpx>=0.24.0",
+    "influxdb-client>=1.48.0",
 ]
 requires-python = ">=3.8"
 readme = "README.md"
 license = {text = "MIT"}
 
 [project.scripts]
-podman-gitops = "src.cli:cli"
+podman-gitops = "src.cli:app"
 
 [build-system]
 requires = ["hatchling"]

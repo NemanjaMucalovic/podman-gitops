@@ -1,10 +1,16 @@
 from prometheus_client import Counter, Gauge, Histogram
 from typing import Dict, Optional, Any
+import logging
 
-class MetricsCollector:
+from . import BaseMetricsCollector
+
+logger = logging.getLogger(__name__)
+
+class PrometheusMetricsCollector(BaseMetricsCollector):
     """Collects and exposes Prometheus metrics for the GitOps service."""
 
     def __init__(self):
+        """Initialize Prometheus metrics."""
         # Deployment metrics
         self.deployment_total = Counter(
             'gitops_deployment_total',
@@ -70,6 +76,8 @@ class MetricsCollector:
             ['app']
         )
 
+        logger.info("Prometheus metrics collector initialized")
+
     def record_deployment(self, status: str, duration: float, labels: Optional[Dict[str, str]] = None) -> None:
         """Record a deployment attempt.
 
@@ -83,6 +91,7 @@ class MetricsCollector:
 
         self.deployment_total.labels(status=status, app=app).inc()
         self.deployment_duration.labels(app=app).observe(duration)
+        logger.debug(f"Recorded deployment metric: {status} for {app} in {duration}s")
 
     def update_active_containers(self, count: int, app: Optional[str] = None) -> None:
         """Update the number of active containers.
@@ -96,6 +105,7 @@ class MetricsCollector:
         else:
             # Create an 'all' label value for total count
             self.active_containers.labels(app='all').set(count)
+        logger.debug(f"Updated active containers count: {count} for {app or 'all'}")
 
     def update_active_apps(self, count: int) -> None:
         """Update the number of active applications.
@@ -104,6 +114,7 @@ class MetricsCollector:
             count: Number of active applications
         """
         self.active_apps.set(count)
+        logger.debug(f"Updated active apps count: {count}")
 
     def record_git_operation(self, operation: str, status: str, duration: float,
                              app: Optional[str] = None) -> None:
@@ -118,6 +129,7 @@ class MetricsCollector:
         app = app or 'unknown'
         self.git_operations.labels(operation=operation, status=status, app=app).inc()
         self.git_operation_duration.labels(operation=operation, app=app).observe(duration)
+        logger.debug(f"Recorded git operation: {operation} for {app} with status {status}")
 
     def record_health_check(self, container: str, status: str, duration: float,
                             app: Optional[str] = None) -> None:
@@ -132,6 +144,7 @@ class MetricsCollector:
         app = app or 'unknown'
         self.health_checks.labels(container=container, status=status, app=app).inc()
         self.health_check_duration.labels(container=container, app=app).observe(duration)
+        logger.debug(f"Recorded health check: {status} for {container} in app {app}")
 
     def update_app_metrics(self, app_name: str, service_counts: Dict[str, int],
                            error_count: int, deployment_age: Optional[float] = None) -> None:
@@ -154,6 +167,8 @@ class MetricsCollector:
         if deployment_age is not None:
             self.app_deployment_age.labels(app=app_name).set(deployment_age)
 
+        logger.debug(f"Updated app metrics for {app_name}")
+
     def reset_app_metrics(self, app_name: str) -> None:
         """Reset metrics for an application.
 
@@ -169,3 +184,10 @@ class MetricsCollector:
 
         # Reset deployment age
         self.app_deployment_age.labels(app=app_name).set(0)
+
+        logger.debug(f"Reset all metrics for {app_name}")
+
+    def close(self) -> None:
+        """Clean up resources."""
+        # No special cleanup needed for Prometheus client
+        pass

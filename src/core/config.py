@@ -67,6 +67,7 @@ class MetricsConfig(BaseModel):
     enabled: bool = Field(default=True, description="Enable metrics endpoint")
     port: int = Field(default=8000, description="Port for metrics endpoint")
     host: str = Field(default="0.0.0.0", description="Host for metrics endpoint")
+    type: str = Field(default="prometheus", description="Type of metrics endpoint")
 
 class ApplicationsConfig(BaseModel):
     """Configuration for applications."""

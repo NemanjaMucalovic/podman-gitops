@@ -33,7 +33,7 @@ User=$CURRENT_USER
 Environment=HOME=$USER_HOME
 Environment=XDG_RUNTIME_DIR=/run/user/$(id -u)
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus
-ExecStart=$USER_HOME/.local/bin/podman-gitops start --config $USER_HOME/.config/podman-gitops/config.toml
+ExecStart=$USER_HOME/.local/bin/podman-gitops start --config $USER_HOME/.config/podman-gitops/main.toml
 Restart=always
 RestartSec=10
 
@@ -45,7 +45,7 @@ EOF
 systemctl --user daemon-reload
 
 echo "Installation complete!"
-echo "Please configure $USER_HOME/.config/podman-gitops/config.toml before starting the service"
+echo "Please configure $USER_HOME/.config/podman-gitops/main.toml before starting the service"
 echo "To start the service, run: systemctl --user start podman-gitops"
 echo "To enable the service, run: systemctl --user enable podman-gitops"
 echo "To enable lingering (allow service to run without user being logged in), run: sudo loginctl enable-linger $CURRENT_USER" 
