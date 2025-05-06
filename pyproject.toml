@@ -16,6 +16,7 @@ dependencies = [
     "typer>=0.9.0",
     "httpx>=0.24.0",
     "influxdb-client>=1.48.0",
+    "pytest>=8.3.5",
 ]
 requires-python = ">=3.8"
 readme = "README.md"
@@ -49,4 +50,3 @@ known-first-party = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-v --cov=src" 

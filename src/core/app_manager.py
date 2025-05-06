@@ -1,3 +1,4 @@
+# src/core/app_manager.py
 import logging
 import os
 from pathlib import Path
@@ -78,18 +79,27 @@ class ApplicationManager:
                 logger.error(f"Configuration for application {app_name} not found")
                 return False
 
+            # Register application in state manager with description
+            self.state_manager.register_application(
+                app_name=app_name,
+                description=app_config.description
+            )
+
             # Determine quadlet directory
             quadlet_dir = app_config.quadlet_dir
+            commit_hash = "local"  # Default for non-Git deployments
+
             if self.git_ops:
                 # If using Git, update repository first
                 repo_dir = self.git_ops.work_dir
                 if not self.git_ops.pull_changes():
                     logger.error(f"Failed to pull changes from Git repository")
+                    # Record failed deployment
                     self.state_manager.record_deployment(
-                        app_name,
-                        self.git_ops.get_current_commit(),
-                        "failed",
-                        "Git pull failed"
+                        app_name=app_name,
+                        commit_hash=self.git_ops.get_current_commit(),
+                        status="failed",
+                        error_message="Git pull failed"
                     )
                     return False
 
@@ -98,8 +108,12 @@ class ApplicationManager:
 
                 # Use quadlet directory relative to the repository
                 quadlet_dir = repo_dir / app_config.quadlet_dir
-            else:
-                commit_hash = "local"
+
+            # Start a new deployment in the state manager
+            deployment_id = self.state_manager.start_deployment(
+                app_name=app_name,
+                commit_hash=commit_hash
+            )
 
             # Process and deploy quadlet files
             logger.info(f"Processing quadlet files for {app_name} from {quadlet_dir}")
@@ -111,22 +125,21 @@ class ApplicationManager:
 
             if not success:
                 logger.error(f"Failed to process quadlet files for application {app_name}")
-                self.state_manager.record_deployment(
-                    app_name,
-                    commit_hash,
-                    "failed",
-                    "Failed to process quadlet files"
+                # Finish deployment as failed
+                self.state_manager.finish_deployment(
+                    deployment_id=deployment_id,
+                    status="failed",
+                    error_message="Failed to process quadlet files"
                 )
                 return False
 
             # Reload systemd daemon
             if not self.systemd_manager.reload_daemon():
                 logger.error("Failed to reload systemd daemon")
-                self.state_manager.record_deployment(
-                    app_name,
-                    commit_hash,
-                    "failed",
-                    "Failed to reload systemd daemon"
+                self.state_manager.finish_deployment(
+                    deployment_id=deployment_id,
+                    status="failed",
+                    error_message="Failed to reload systemd daemon"
                 )
                 return False
 
@@ -136,30 +149,44 @@ class ApplicationManager:
             for service_name in deployed_services:
                 logger.info(f"Starting service: {service_name}")
 
-                # Update service state
-                self.state_manager.set_service_state(app_name, service_name, "starting")
+                # Update service state to starting
+                self.state_manager.update_service(
+                    app_name=app_name,
+                    service_name=service_name,
+                    state="starting",
+                    deployment_id=deployment_id
+                )
 
                 # Start the service
                 if not self.systemd_manager.start_service(service_name):
                     logger.error(f"Failed to start service {service_name}")
-                    self.state_manager.set_service_state(app_name, service_name, "failed")
+                    self.state_manager.update_service(
+                        app_name=app_name,
+                        service_name=service_name,
+                        state="failed",
+                        deployment_id=deployment_id
+                    )
                     self.state_manager.set_last_error(
-                        app_name,
-                        service_name,
-                        "Failed to start service"
+                        app_name=app_name,
+                        service_name=service_name,
+                        error_message="Failed to start service"
                     )
                     all_started = False
                 else:
                     logger.info(f"Service {service_name} started successfully")
-                    self.state_manager.set_service_state(app_name, service_name, "running")
+                    self.state_manager.update_service(
+                        app_name=app_name,
+                        service_name=service_name,
+                        state="running",
+                        deployment_id=deployment_id
+                    )
 
             if not all_started:
                 logger.error(f"Some services failed to start for application {app_name}")
-                self.state_manager.record_deployment(
-                    app_name,
-                    commit_hash,
-                    "failed",
-                    "Some services failed to start"
+                self.state_manager.finish_deployment(
+                    deployment_id=deployment_id,
+                    status="failed",
+                    error_message="Some services failed to start"
                 )
                 return False
 
@@ -181,17 +208,31 @@ class ApplicationManager:
                     # Update state based on health
                     if health_data.get("healthy", False):
                         logger.info(f"Service {service_name} is healthy")
-                        self.state_manager.set_service_state(app_name, service_name, "running")
+                        self.state_manager.update_service(
+                            app_name=app_name,
+                            service_name=service_name,
+                            state="running",
+                            deployment_id=deployment_id
+                        )
 
                         # Add health check to state manager
-                        self.state_manager.add_health_check(app_name, service_name, health_data)
+                        self.state_manager.add_health_check(
+                            app_name=app_name,
+                            service_name=service_name,
+                            health_data=health_data
+                        )
                     else:
                         logger.warning(f"Service {service_name} is unhealthy: {health_data}")
-                        self.state_manager.set_service_state(app_name, service_name, "unhealthy")
+                        self.state_manager.update_service(
+                            app_name=app_name,
+                            service_name=service_name,
+                            state="unhealthy",
+                            deployment_id=deployment_id
+                        )
                         self.state_manager.set_last_error(
-                            app_name,
-                            service_name,
-                            f"Health check failed: {health_data.get('status', 'unknown')}"
+                            app_name=app_name,
+                            service_name=service_name,
+                            error_message=f"Health check failed: {health_data.get('status', 'unknown')}"
                         )
                         all_healthy = False
 
@@ -202,8 +243,17 @@ class ApplicationManager:
 
                 except Exception as e:
                     logger.error(f"Error checking health for service {service_name}: {e}")
-                    self.state_manager.set_service_state(app_name, service_name, "unknown")
-                    self.state_manager.set_last_error(app_name, service_name, f"Health check error: {str(e)}")
+                    self.state_manager.update_service(
+                        app_name=app_name,
+                        service_name=service_name,
+                        state="unknown",
+                        deployment_id=deployment_id
+                    )
+                    self.state_manager.set_last_error(
+                        app_name=app_name,
+                        service_name=service_name,
+                        error_message=f"Health check error: {str(e)}"
+                    )
                     all_healthy = False
 
             # Wait for containers to become healthy
@@ -216,38 +266,56 @@ class ApplicationManager:
                     if not self.health_checker.wait_for_healthy(service_name, timeout=30):
                         logger.warning(f"Service {service_name} did not stabilize within timeout period")
                         all_healthy = False
-                        self.state_manager.set_service_state(app_name, service_name, "unstable")
+                        self.state_manager.update_service(
+                            app_name=app_name,
+                            service_name=service_name,
+                            state="unstable",
+                            deployment_id=deployment_id
+                        )
                         self.state_manager.set_last_error(
-                            app_name,
-                            service_name,
-                            "Service did not stabilize within timeout period"
+                            app_name=app_name,
+                            service_name=service_name,
+                            error_message="Service did not stabilize within timeout period"
                         )
 
             # Record final deployment status
             if all_healthy:
-                self.state_manager.record_deployment(app_name, commit_hash, "success")
+                self.state_manager.finish_deployment(
+                    deployment_id=deployment_id,
+                    status="success"
+                )
                 logger.info(f"Application {app_name} deployed successfully with all services healthy")
                 self.processed_apps.add(app_name)
                 return True
             else:
-                self.state_manager.record_deployment(
-                    app_name,
-                    commit_hash,
-                    "failed",
-                    "Some services are unhealthy or unstable"
+                self.state_manager.finish_deployment(
+                    deployment_id=deployment_id,
+                    status="failed",
+                    error_message="Some services are unhealthy or unstable"
                 )
                 logger.error(f"Application {app_name} deployment completed but some services are unhealthy")
                 return False
 
         except Exception as e:
             logger.error(f"Error processing application {app_name}: {e}")
-            if self.git_ops:
-                self.state_manager.record_deployment(
-                    app_name,
-                    self.git_ops.get_current_commit(),
-                    "failed",
-                    str(e)
-                )
+            # Record error if deployment was started
+            try:
+                if self.git_ops:
+                    self.state_manager.record_deployment(
+                        app_name=app_name,
+                        commit_hash=self.git_ops.get_current_commit(),
+                        status="failed",
+                        error_message=str(e)
+                    )
+                else:
+                    self.state_manager.record_deployment(
+                        app_name=app_name,
+                        commit_hash="local",
+                        status="failed",
+                        error_message=str(e)
+                    )
+            except Exception as record_error:
+                logger.error(f"Failed to record deployment failure: {record_error}")
             return False
 
     def process_all_applications(self) -> Dict[str, bool]:
@@ -281,12 +349,13 @@ class ApplicationManager:
             # Get application status from state manager
             app_status = self.state_manager.get_app_status_summary(app_name)
 
-            # Add configuration info
-            app_status["config"] = {
-                "description": app_config.description,
-                "quadlet_dir": str(app_config.quadlet_dir),
-                "env_var_count": len(app_config.env or {})
-            }
+            # Add configuration info if not already included
+            if "config" not in app_status:
+                app_status["config"] = {
+                    "description": app_config.description,
+                    "quadlet_dir": str(app_config.quadlet_dir),
+                    "env_var_count": len(app_config.env or {})
+                }
 
             return app_status
 
@@ -300,12 +369,20 @@ class ApplicationManager:
         Returns:
             Dictionary of application names and their status
         """
-        results = {}
-
-        for app_name in self.get_app_list():
-            results[app_name] = self.get_application_status(app_name)
-
-        return results
+        try:
+            # Use the state manager's optimized method
+            return self.state_manager.get_status_all_applications()
+        except Exception as e:
+            logger.error(f"Failed to get status of all applications: {e}")
+            # Fallback to individual status calls
+            results = {}
+            for app_name in self.get_app_list():
+                try:
+                    results[app_name] = self.get_application_status(app_name)
+                except Exception as app_error:
+                    logger.error(f"Failed to get status for {app_name}: {app_error}")
+                    results[app_name] = {"status": "error", "error": str(app_error)}
+            return results
 
     def start_application(self, app_name: str) -> bool:
         """Start all services for an application.
@@ -331,16 +408,24 @@ class ApplicationManager:
                 logger.info(f"Starting service: {service_name}")
 
                 # Update service state
-                self.state_manager.set_service_state(app_name, service_name, "starting")
+                self.state_manager.update_service(
+                    app_name=app_name,
+                    service_name=service_name,
+                    state="starting"
+                )
 
                 # Start the service
                 if not self.systemd_manager.start_service(service_name):
                     logger.error(f"Failed to start service {service_name}")
-                    self.state_manager.set_service_state(app_name, service_name, "failed")
+                    self.state_manager.update_service(
+                        app_name=app_name,
+                        service_name=service_name,
+                        state="failed"
+                    )
                     self.state_manager.set_last_error(
-                        app_name,
-                        service_name,
-                        "Failed to start service"
+                        app_name=app_name,
+                        service_name=service_name,
+                        error_message="Failed to start service"
                     )
                     success = False
                 else:
@@ -350,11 +435,23 @@ class ApplicationManager:
                     health_data = self.health_checker.check_container_health(service_name)
                     if health_data.get("healthy", False):
                         logger.info(f"Service {service_name} is healthy")
-                        self.state_manager.set_service_state(app_name, service_name, "running")
-                        self.state_manager.add_health_check(app_name, service_name, health_data)
+                        self.state_manager.update_service(
+                            app_name=app_name,
+                            service_name=service_name,
+                            state="running"
+                        )
+                        self.state_manager.add_health_check(
+                            app_name=app_name,
+                            service_name=service_name,
+                            health_data=health_data
+                        )
                     else:
                         logger.warning(f"Service {service_name} started but is unhealthy: {health_data}")
-                        self.state_manager.set_service_state(app_name, service_name, "unhealthy")
+                        self.state_manager.update_service(
+                            app_name=app_name,
+                            service_name=service_name,
+                            state="unhealthy"
+                        )
                         success = False
 
             return success
@@ -387,20 +484,28 @@ class ApplicationManager:
                 logger.info(f"Stopping service: {service_name}")
 
                 # Update service state
-                self.state_manager.set_service_state(app_name, service_name, "stopping")
+                self.state_manager.update_service(
+                    app_name=app_name,
+                    service_name=service_name,
+                    state="stopping"
+                )
 
                 # Stop the service
                 if not self.systemd_manager.stop_service(service_name):
                     logger.error(f"Failed to stop service {service_name}")
                     self.state_manager.set_last_error(
-                        app_name,
-                        service_name,
-                        "Failed to stop service"
+                        app_name=app_name,
+                        service_name=service_name,
+                        error_message="Failed to stop service"
                     )
                     success = False
                 else:
                     logger.info(f"Service {service_name} stopped successfully")
-                    self.state_manager.set_service_state(app_name, service_name, "stopped")
+                    self.state_manager.update_service(
+                        app_name=app_name,
+                        service_name=service_name,
+                        state="stopped"
+                    )
 
             return success
 
