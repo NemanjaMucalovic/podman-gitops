@@ -41,17 +41,6 @@ class EnvironmentConfig(BaseModel):
 
         return result
 
-class ApplicationConfig(BaseModel):
-    """Configuration for an application."""
-    name: str = Field(..., description="Name of the application")
-    description: Optional[str] = Field(default=None, description="Description of the application")
-    quadlet_dir: Path = Field(..., description="Directory containing quadlet files")
-    env: Dict[str, str] = Field(default_factory=dict, description="Environment variables")
-
-    class Config:
-        arbitrary_types_allowed = True
-
-
 class GitConfig(BaseModel):
     """Configuration for Git operations."""
     repository_url: str = Field(..., description="URL of the Git repository")
@@ -61,6 +50,17 @@ class GitConfig(BaseModel):
     ssh_key_password: Optional[str] = Field(default=None, description="Password for SSH key (if encrypted)")
     repo_dir: Optional[Path] = Field(default=None, description="Custom directory for repository checkout")
     quadlet_files_dir: str = Field(default="", description="Directory inside repository containing quadlet files (e.g., 'draw' or 'quadlets')")
+
+class ApplicationConfig(BaseModel):
+    """Configuration for an application."""
+    name: str = Field(..., description="Name of the application")
+    description: Optional[str] = Field(default=None, description="Description of the application")
+    quadlet_dir: Path = Field(..., description="Directory containing quadlet files")
+    env: Dict[str, str] = Field(default_factory=dict, description="Environment variables")
+    git: Optional[GitConfig] = Field(default=None, description="Git configuration specific to this application")
+
+    class Config:
+        arbitrary_types_allowed = True
 
 class MetricsConfig(BaseModel):
     """Configuration for metrics endpoint."""

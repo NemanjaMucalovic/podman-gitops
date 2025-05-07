@@ -97,4 +97,39 @@ class GitOperations:
             return True
         except GitCommandError as e:
             logger.error(f"Failed to checkout branch: {e}")
-            raise 
+            raise
+
+    def has_changes(self) -> bool:
+        """Check if there are any changes in the remote repository.
+
+        Returns:
+            True if there are changes that need to be pulled, False otherwise
+        """
+        try:
+            if not self.repo:
+                repo_dir = self.config.repo_dir or self.work_dir
+                self.repo = Repo(repo_dir)
+
+            # Fetch from remote to update refs
+            logger.info("Fetching from remote to check for changes")
+            self.repo.remotes.origin.fetch()
+
+            # Get current and remote commit hashes
+            local_commit = self.repo.head.commit.hexsha
+            remote_branch = f"origin/{self.config.branch}"
+            remote_commit = self.repo.refs[remote_branch].commit.hexsha
+
+            # Compare the commits
+            has_changes = local_commit != remote_commit
+
+            if has_changes:
+                logger.info(f"Remote changes detected (local: {local_commit[:8]}, remote: {remote_commit[:8]})")
+            else:
+                logger.info("No changes detected in remote repository")
+
+            return has_changes
+
+        except GitCommandError as e:
+            logger.error(f"Failed to check for changes: {e}")
+            # If we can't check properly, assume there are changes to be safe
+            return True
