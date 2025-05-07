@@ -45,11 +45,12 @@ class GitConfig(BaseModel):
     """Configuration for Git operations."""
     repository_url: str = Field(..., description="URL of the Git repository")
     branch: str = Field(default="main", description="Branch to track")
-    poll_interval: int = Field(default=300, description="Polling interval in seconds")
+    poll_interval: str = Field(default="*/5 * * * *", description="Polling interval as cron expression (default: every 5 minutes)")
     ssh_key_path: Optional[Path] = Field(default=None, description="Path to SSH private key")
     ssh_key_password: Optional[str] = Field(default=None, description="Password for SSH key (if encrypted)")
     repo_dir: Optional[Path] = Field(default=None, description="Custom directory for repository checkout")
     quadlet_files_dir: str = Field(default="", description="Directory inside repository containing quadlet files (e.g., 'draw' or 'quadlets')")
+
 
 class ApplicationConfig(BaseModel):
     """Configuration for an application."""

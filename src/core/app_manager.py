@@ -436,7 +436,7 @@ class ApplicationManager:
         Returns:
             Dictionary of application names and their success status
         """
-        # Reset the Git manager cycle to clear cached repository status
+        # Reset the Git manager cycle
         self.git_manager.reset_cycle()
 
         results = {}

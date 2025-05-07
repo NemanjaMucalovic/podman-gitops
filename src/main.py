@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 import signal
 import sys
+from datetime import datetime
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI
@@ -15,6 +16,7 @@ from src.core.quadlet_handler import QuadletHandler
 from src.core.systemd_manager import SystemdManager
 from src.core.git_operations import GitOperations
 from src.core.app_manager import ApplicationManager
+from src.core.scheduler import CronScheduler
 from src.state.manager import StateManager
 from src.metrics import get_metrics_collector
 from src.core.logging import setup_logging, get_logger
@@ -93,7 +95,8 @@ def ensure_directories(paths):
 
 def start_api_server(config, host: str, port: int) -> Optional[threading.Thread]:
     """Start the API server in a separate thread."""
-    if not config.metrics.enabled:
+    if not config.metrics.enabled or config.metrics.type != "prometheus":
+        logger.info("API server not started: metrics disabled or not using Prometheus")
         return None
 
     try:
@@ -181,9 +184,31 @@ def main(config_path: Optional[Path] = None, no_api: bool = False) -> int:
             git_ops=git_ops
         )
 
+        # Initialize scheduler
+        scheduler = CronScheduler()
+
+        # Configure schedules for all applications
+        if config.git and config.git.poll_interval:
+            # Set global schedule if configured
+            global_schedule = config.git.poll_interval
+            logger.info(f"Using global schedule: {global_schedule}")
+
+            # Set schedule for each application
+            for app_name in config.applications.enabled:
+                app_config = config.app_configs.get(app_name)
+                if app_config and hasattr(app_config, 'git') and app_config.git and app_config.git.poll_interval:
+                    # Use app-specific schedule if available
+                    app_schedule = app_config.git.poll_interval
+                    logger.info(f"Using app-specific schedule for {app_name}: {app_schedule}")
+                else:
+                    # Fall back to global schedule
+                    app_schedule = global_schedule
+
+                scheduler.set_schedule(app_name, app_schedule)
+
         # Start API server if enabled
         api_thread = None
-        if not no_api and config.metrics.enabled:
+        if not no_api and config.metrics.enabled and getattr(config.metrics, 'type', 'prometheus') == "prometheus":
             api_thread = start_api_server(
                 config,
                 host=config.metrics.host,
@@ -195,13 +220,29 @@ def main(config_path: Optional[Path] = None, no_api: bool = False) -> int:
 
         while running:
             try:
-                # Process all applications
+                # Process applications that are due to run
                 start_time = time.time()
-                results = app_manager.process_all_applications()
+                results = {}
 
-                # Record metrics if collector is available
-                duration = time.time() - start_time
-                if metrics_collector:
+                # Reset Git manager cycle
+                app_manager.git_manager.reset_cycle()
+
+                # Check each application against its schedule
+                for app_name in config.applications.enabled:
+                    if scheduler.is_due(app_name):
+                        logger.info(f"Application {app_name} is due to run")
+                        results[app_name] = app_manager.process_application(app_name)
+
+                        # Update next run time
+                        scheduler.update_next_run(app_name)
+                    else:
+                        next_run = scheduler.get_next_run(app_name)
+                        if next_run:
+                            logger.debug(f"Application {app_name} next run at {next_run}")
+
+                # Record metrics if there were processed apps
+                if results and metrics_collector:
+                    duration = time.time() - start_time
                     for app_name, success in results.items():
                         metrics_collector.record_deployment(
                             "success" if success else "failure",
@@ -212,18 +253,22 @@ def main(config_path: Optional[Path] = None, no_api: bool = False) -> int:
                     # Update active containers count
                     active_services = 0
                     for app_name in config.applications.enabled:
-                        app_status = app_manager.get_application_status(app_name)
-                        active_services += len([s for s, state in app_status.get('services', {}).items()
-                                                if state == 'running'])
+                        try:
+                            app_status = app_manager.get_application_status(app_name)
+                            active_services += len([s for s, state in app_status.get('services', {}).items()
+                                                    if state == 'running'])
+                        except Exception as e:
+                            logger.error(f"Error getting status for {app_name}: {e}")
 
-                    metrics_collector.update_active_containers(active_services)
+                    if hasattr(metrics_collector, 'update_active_containers'):
+                        metrics_collector.update_active_containers(active_services)
 
-                # Wait for the next poll interval
-                poll_interval = config.git.poll_interval if config.git else 300
-                logger.info(f"Waiting {poll_interval} seconds until next check")
+                # Wait a short time before checking schedules again
+                wait_interval = 10  # Check schedules every 10 seconds
+                logger.debug(f"Waiting {wait_interval} seconds before checking schedules again")
 
                 # Use a small wait interval to check running flag more frequently
-                for _ in range(poll_interval):
+                for _ in range(wait_interval):
                     if not running:
                         break
                     time.sleep(1)
@@ -241,4 +286,17 @@ def main(config_path: Optional[Path] = None, no_api: bool = False) -> int:
 
 if __name__ == "__main__":
     # Direct execution for testing or development
-    sys.exit(main())
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Podman GitOps Service")
+    parser.add_argument('--config', '-c', type=str,
+                        help='Path to config.toml file')
+    parser.add_argument('--no-api', action='store_true',
+                        help='Disable API server')
+    args = parser.parse_args()
+
+    config_path = args.config
+    if config_path:
+        config_path = Path(config_path)
+
+    sys.exit(main(config_path=config_path, no_api=args.no_api))
